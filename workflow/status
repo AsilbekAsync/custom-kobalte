@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Summarize plans and active locks.
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+PLANS="$ROOT/workflow/plans"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  workflow/status
+  workflow/status --help
+
+Lists plan files with status/owner/updated values, then prints active locks.
+EOF
+}
+
+cmd_status() {
+  local file name title state owner updated found=0
+  printf 'Plans\n'
+  for file in "$PLANS"/*.md; do
+    [[ -f "$file" ]] || continue
+    name=$(basename -- "$file")
+    [[ "$name" == "_template.md" ]] && continue
+    found=1
+    title=$(sed -n '1s/^# //p' "$file" | head -n1)
+    state=$(sed -n 's/^- Status: //p' "$file" | head -n1)
+    owner=$(sed -n 's/^- Owner: //p' "$file" | head -n1)
+    updated=$(sed -n 's/^- Updated: //p' "$file" | head -n1)
+    printf '[%s] %s\n' "${state:-?}" "$name"
+    printf '  %s\n' "${title:-?}"
+    printf '  updated %s · owner %s\n' "${updated:-?}" "${owner:-?}"
+  done
+  [[ $found -eq 1 ]] || printf '  (no plans)\n'
+
+  printf '\nLocks\n'
+  "$ROOT/workflow/lock" list
+}
+
+case "${1:-}" in
+  ""|status) cmd_status ;;
+  -h|--help|help) usage ;;
+  *) printf 'status: unexpected argument: %s\n' "$1" >&2; exit 1 ;;
+esac

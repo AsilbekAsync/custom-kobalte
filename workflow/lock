@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# Advisory per-path lock for agents working in this checkout.
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+LOCKS="$ROOT/workflow/locks"
+STALE_MINUTES=${WORKFLOW_LOCK_STALE_MINUTES:-60}
+[[ "$STALE_MINUTES" =~ ^[0-9]+$ ]] || STALE_MINUTES=60
+mkdir -p "$LOCKS"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  workflow/lock acquire <path|@resource> [reason] [--wait seconds]
+  workflow/lock release <path|@resource> [--force]
+  workflow/lock touch <path|@resource>
+  workflow/lock status <path|@resource>
+  workflow/lock list
+  workflow/lock prune [--apply]
+  workflow/lock run <path|@resource> [reason] -- <command...>
+  workflow/lock whoami
+  workflow/lock --help
+
+Paths are repo-relative (or absolute inside the repo). Resources use
+@name, e.g. @dev-server, @build, @deps. Locks cover the exact path and its
+ancestors/descendants. Age is measured from the last touch and a lock is
+stale after WORKFLOW_LOCK_STALE_MINUTES (default 60).
+EOF
+}
+
+die() {
+  printf 'lock: %s\n' "$*" >&2
+  exit 1
+}
+
+identity() {
+  printf '%s\n' "${AGENT_NAME:-${OPENCODE_SESSION_ID:-unknown}}"
+}
+
+normalize() {
+  local target=$1 abs rel
+  if [[ "$target" == @* ]]; then
+    [[ "$target" =~ ^@[A-Za-z0-9._-]+$ ]] || die "invalid resource name: $target"
+    printf '%s\n' "$target"
+    return
+  fi
+  if [[ "$target" == /* ]]; then
+    abs=$(realpath -m -- "$target")
+  else
+    abs=$(realpath -m -- "$ROOT/$target")
+  fi
+  [[ "$abs" == "$ROOT" || "$abs" == "$ROOT"/* ]] || die "path is outside the repo: $target"
+  rel=${abs#"$ROOT"}
+  rel=${rel#/}
+  [[ -n "$rel" ]] || die "refusing to lock the repo root; lock a specific path"
+  printf '%s\n' "$rel"
+}
+
+lock_name() {
+  local rel=$1 base hash
+  base=$(basename -- "$rel")
+  base=${base//[^A-Za-z0-9._-]/_}
+  base=${base:0:80}
+  [[ -n "$base" ]] || base=path
+  hash=$(printf '%s' "$rel" | sha1sum | cut -c1-10)
+  printf 'p__%s__%s.lock\n' "$base" "$hash"
+}
+
+legacy_lock_name() {
+  printf 'p__%s.lock\n' "$(printf '%s' "$1" | sed 's#/#__#g; s#[^A-Za-z0-9._-]#_#g')"
+}
+
+lock_dir_for() {
+  local rel=$1 dir
+  dir="$LOCKS/$(lock_name "$rel")"
+  [[ -d "$dir" ]] && { printf '%s\n' "$dir"; return; }
+  dir="$LOCKS/$(legacy_lock_name "$rel")"
+  [[ -d "$dir" ]] && { printf '%s\n' "$dir"; return; }
+  printf '%s\n' "$LOCKS/$(lock_name "$rel")"
+}
+
+lock_dirs() {
+  find "$LOCKS" -mindepth 1 -maxdepth 1 -type d -name '*.lock' -print
+}
+
+field() {
+  sed -n "s/^${2}=//p" "$1/owner" 2>/dev/null | head -n1
+}
+
+owner_path() {
+  field "$1" path
+}
+
+show_owner() {
+  local dir=$1
+  sed -n '1,20p' "$dir/owner" 2>/dev/null || true
+}
+
+age_minutes() {
+  local dir=$1 ts epoch now
+  ts=$(field "$dir" updated)
+  [[ -n "$ts" ]] || ts=$(field "$dir" created)
+  [[ -n "$ts" ]] || { printf '?\n'; return; }
+  epoch=$(date -u -d "$ts" +%s 2>/dev/null) || { printf '?\n'; return; }
+  now=$(date -u +%s)
+  local age=$(( (now - epoch) / 60 ))
+  (( age < 0 )) && age=0
+  printf '%s\n' "$age"
+}
+
+is_stale() {
+  local dir=$1 age
+  age=$(age_minutes "$dir")
+  [[ "$age" =~ ^[0-9]+$ ]] && (( age >= STALE_MINUTES ))
+}
+
+print_lock_info() {
+  local dir=$1 age stale=no
+  age=$(age_minutes "$dir")
+  if [[ "$age" =~ ^[0-9]+$ ]] && (( age >= STALE_MINUTES )); then
+    stale=yes
+  fi
+  printf 'path=%s\n' "$(field "$dir" path)"
+  printf 'agent=%s\n' "$(field "$dir" agent)"
+  printf 'session=%s\n' "$(field "$dir" session)"
+  printf 'created=%s\n' "$(field "$dir" created)"
+  printf 'updated=%s\n' "$(field "$dir" updated)"
+  printf 'age_minutes=%s\n' "$age"
+  printf 'stale=%s\n' "$stale"
+  printf 'reason=%s\n' "$(field "$dir" reason)"
+}
+
+conflict_with() {
+  local target=$1 dir other
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    other=$(owner_path "$dir")
+    [[ -n "${other:-}" ]] || continue
+    if [[ "$target" == "$other" || "$target" == "$other/"* || "$other" == "$target/"* ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done < <(lock_dirs)
+  return 1
+}
+
+write_owner() {
+  local dir=$1 rel=$2 reason=$3
+  if ! {
+    printf 'path=%s\n' "$rel"
+    printf 'agent=%s\n' "$(identity)"
+    printf 'session=%s\n' "${OPENCODE_SESSION_ID:-unknown}"
+    printf 'pid=%s\n' "$$"
+    printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'updated=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'cwd=%s\n' "$PWD"
+    printf 'reason=%s\n' "$reason"
+  } > "$dir/owner"; then
+    rm -rf -- "$dir"
+    die "could not write lock metadata for $rel"
+  fi
+}
+
+check_owner() {
+  local dir=$1 action=$2 owner_agent current
+  owner_agent=$(field "$dir" agent)
+  current=$(identity)
+  if [[ -n "$owner_agent" && "$owner_agent" != "unknown" && "$current" != "unknown" && "$owner_agent" != "$current" ]]; then
+    die "lock is held by $owner_agent; use --force only if it is stale ($action)"
+  fi
+}
+
+cmd_acquire() {
+  local target="" reason="" wait=0 rel dir conflict
+  while (( $# )); do
+    case "$1" in
+      --wait)
+        [[ $# -ge 2 ]] || die "--wait needs a number of seconds"
+        wait=$2
+        shift 2
+        ;;
+      --wait=*)
+        wait=${1#*=}
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$target" ]]; then
+          target=$1
+        elif [[ -z "$reason" ]]; then
+          reason=$1
+        else
+          die "unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "acquire needs a path or @resource"
+  [[ "$wait" =~ ^[0-9]+$ ]] || die "--wait must be a non-negative integer"
+  rel=$(normalize "$target")
+  reason=${reason//$'\n'/ }
+  local deadline=$((SECONDS + wait))
+
+  while :; do
+    if conflict=$(conflict_with "$rel"); then
+      if (( SECONDS >= deadline )); then
+        printf 'lock: busy: %s is covered by %s\n' "$rel" "${conflict#"$LOCKS"/}" >&2
+        show_owner "$conflict" >&2
+        exit 1
+      fi
+      sleep 1
+      continue
+    fi
+
+    dir="$LOCKS/$(lock_name "$rel")"
+    if mkdir "$dir" 2>/dev/null; then
+      write_owner "$dir" "$rel" "$reason"
+      printf 'locked %s\n' "$rel"
+      return 0
+    fi
+
+    if (( SECONDS >= deadline )); then
+      printf 'lock: busy: %s\n' "$rel" >&2
+      [[ -f "$dir/owner" ]] && show_owner "$dir" >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+cmd_release() {
+  local target="" force=0 rel dir
+  while (( $# )); do
+    case "$1" in
+      --force) force=1; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) [[ -z "$target" ]] || die "unexpected argument: $1"; target=$1; shift ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "release needs a path or @resource"
+  rel=$(normalize "$target")
+  dir=$(lock_dir_for "$rel")
+  if [[ ! -d "$dir" ]]; then
+    printf 'lock: not locked: %s\n' "$rel"
+    return 0
+  fi
+  (( force )) || check_owner "$dir" release
+  rm -rf -- "$dir"
+  printf 'released %s\n' "$rel"
+}
+
+cmd_touch() {
+  local target=${1:-} rel dir tmp
+  [[ -n "$target" ]] || die "touch needs a path or @resource"
+  rel=$(normalize "$target")
+  dir=$(lock_dir_for "$rel")
+  [[ -d "$dir" ]] || die "not locked: $rel"
+  [[ -f "$dir/owner" ]] || die "lock metadata missing: $rel"
+  check_owner "$dir" touch
+  tmp="$dir/.owner.$$"
+  grep -v '^updated=' "$dir/owner" > "$tmp" || true
+  printf 'updated=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$tmp"
+  mv -- "$tmp" "$dir/owner"
+  printf 'touched %s\n' "$rel"
+}
+
+cmd_status() {
+  local target=${1:-} rel dir
+  [[ -n "$target" ]] || die "status needs a path or @resource"
+  rel=$(normalize "$target")
+  dir=$(lock_dir_for "$rel")
+  if [[ -d "$dir" ]]; then
+    printf 'locked %s\n' "$rel"
+    print_lock_info "$dir"
+  else
+    printf 'free %s\n' "$rel"
+  fi
+}
+
+cmd_list() {
+  local dir found=0
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    found=1
+    printf '%s\n' "--- ${dir#"$LOCKS"/}"
+    print_lock_info "$dir"
+  done < <(lock_dirs | sort)
+  [[ $found -eq 1 ]] || printf 'no locks\n'
+}
+
+cmd_prune() {
+  local apply=0 dir age count=0
+  while (( $# )); do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --dry-run) apply=0; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) die "unexpected argument: $1" ;;
+    esac
+  done
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    is_stale "$dir" || continue
+    count=$((count + 1))
+    age=$(age_minutes "$dir")
+    if (( apply )); then
+      printf 'removing stale %s (%s min, owner %s)\n' "$(field "$dir" path)" "$age" "$(field "$dir" agent)"
+      rm -rf -- "$dir"
+    else
+      printf 'stale %s (%s min, owner %s)\n' "$(field "$dir" path)" "$age" "$(field "$dir" agent)"
+    fi
+  done < <(lock_dirs | sort)
+  if (( count == 0 )); then
+    printf 'no stale locks (threshold: %s min)\n' "$STALE_MINUTES"
+  elif (( !apply )); then
+    printf '%d stale lock(s); rerun with --apply to remove them\n' "$count"
+  fi
+}
+
+cmd_run() {
+  local target="" reason="" status=0
+  while (( $# )); do
+    case "$1" in
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown option before --: $1"
+        ;;
+      *)
+        if [[ -z "$target" ]]; then
+          target=$1
+        elif [[ -z "$reason" ]]; then
+          reason=$1
+        else
+          die "unexpected argument before --: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "run needs a path or @resource"
+  [[ $# -gt 0 ]] || die "run needs a command after --"
+  cmd_acquire "$target" "$reason"
+  trap 'cmd_release "$target"' EXIT
+  "$@" || status=$?
+  cmd_release "$target"
+  trap - EXIT
+  return "$status"
+}
+
+cmd_whoami() {
+  printf 'agent=%s\n' "$(identity)"
+  printf 'session=%s\n' "${OPENCODE_SESSION_ID:-unknown}"
+  printf 'root=%s\n' "$ROOT"
+}
+
+case "${1:-}" in
+  acquire) shift; cmd_acquire "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  touch) shift; cmd_touch "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  prune) shift; cmd_prune "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  whoami) shift; cmd_whoami "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac

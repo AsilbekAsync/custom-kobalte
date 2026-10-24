@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Create a plan from workflow/plans/_template.md.
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+PLANS="$ROOT/workflow/plans"
+TEMPLATE="$PLANS/_template.md"
+mkdir -p "$PLANS"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  workflow/plan new <slug> [title...]
+  workflow/plan --help
+
+Creates workflow/plans/YYYY-MM-DD-HHMM-<slug>.md from _template.md.
+The slug must contain only lowercase letters, digits, dots, underscores, and
+hyphens. If no title is given, the slug is used as the title.
+EOF
+}
+
+die() {
+  printf 'plan: %s\n' "$*" >&2
+  exit 1
+}
+
+escape_sed() {
+  printf '%s' "$1" | sed 's/[\\&#]/\\&/g'
+}
+
+cmd_new() {
+  local slug=${1:-}
+  [[ -n "$slug" ]] || die "new needs a slug"
+  shift || true
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "invalid slug: $slug"
+  [[ -f "$TEMPLATE" ]] || die "missing template: $TEMPLATE"
+
+  local title="$*"
+  [[ -n "$title" ]] || title=$(printf '%s' "$slug" | tr '_-' '  ')
+
+  local stamp human owner filename escaped_title escaped_owner
+  stamp=$(date +%Y-%m-%d-%H%M)
+  human=$(date '+%Y-%m-%d %H:%M')
+  owner=${AGENT_NAME:-${OPENCODE_SESSION_ID:-unknown}}
+  filename="$PLANS/$stamp-$slug.md"
+  [[ ! -e "$filename" ]] || die "plan already exists: $filename"
+
+  escaped_title=$(escape_sed "$title")
+  escaped_owner=$(escape_sed "$owner")
+
+  sed \
+    -e "s#<short task title>#${escaped_title}#g" \
+    -e "s#<agent/session>#${escaped_owner}#g" \
+    -e "s#YYYY-MM-DD HH:MM#${human}#g" \
+    -e 's#<paths, or "none">#none#g' \
+    "$TEMPLATE" > "$filename"
+
+  printf '%s\n' "$filename"
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac
